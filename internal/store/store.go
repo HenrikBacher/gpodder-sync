@@ -3,6 +3,8 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -101,6 +103,13 @@ var migrations = []string{
 	);
 	CREATE INDEX episode_actions_received ON episode_actions (user_id, received_at);
 	CREATE INDEX episode_actions_episode  ON episode_actions (user_id, podcast, episode);`,
+	`CREATE TABLE sessions (
+		token_hash BLOB    PRIMARY KEY, -- SHA-256 of the cookie value
+		user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		created_at INTEGER NOT NULL,
+		used_at    INTEGER NOT NULL
+	);
+	CREATE INDEX sessions_used ON sessions (used_at);`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -188,6 +197,65 @@ func (s *Store) ListUsers(ctx context.Context) ([]string, error) {
 		names = append(names, n)
 	}
 	return names, rows.Err()
+}
+
+// ---- sessions --------------------------------------------------------------
+
+// Sessions let clients that send credentials only on login (as the gpodder
+// API intends) make further requests with a cookie. Only a hash of the token
+// is stored, so a copy of the database can't be used to log in.
+
+// SessionIdle is how long an unused session stays valid.
+const SessionIdle = 30 * 24 * time.Hour
+
+func tokenHash(token string) []byte {
+	h := sha256.Sum256([]byte(token))
+	return h[:]
+}
+
+// CreateSession starts a session for userID and returns its token. Expired
+// sessions are deleted at the same time.
+func (s *Store) CreateSession(ctx context.Context, userID int64, now time.Time) (string, error) {
+	token := rand.Text()
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE used_at < ?`, now.Add(-SessionIdle).Unix()); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `INSERT INTO sessions (token_hash, user_id, created_at, used_at) VALUES (?, ?, ?, ?)`,
+			tokenHash(token), userID, now.Unix(), now.Unix())
+		return err
+	})
+	return token, err
+}
+
+// SessionUser returns the user a valid session token belongs to, or
+// ErrNotFound, and records the session as used.
+func (s *Store) SessionUser(ctx context.Context, token string, now time.Time) (int64, string, error) {
+	var id, usedAt int64
+	var name string
+	h := tokenHash(token)
+	err := s.db.QueryRowContext(ctx, `
+		SELECT u.id, u.username, s.used_at FROM sessions s JOIN users u ON u.id = s.user_id
+		WHERE s.token_hash = ?`, h).Scan(&id, &name, &usedAt)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && usedAt < now.Add(-SessionIdle).Unix()) {
+		return 0, "", ErrNotFound
+	}
+	if err != nil {
+		return 0, "", err
+	}
+	// Writing on every request isn't needed; hourly is precise enough for expiry.
+	if usedAt < now.Add(-time.Hour).Unix() {
+		if _, err := s.db.ExecContext(ctx, `UPDATE sessions SET used_at = ? WHERE token_hash = ?`, now.Unix(), h); err != nil {
+			return 0, "", err
+		}
+	}
+	return id, name, nil
+}
+
+// DeleteSession ends a session. Unknown tokens are ignored.
+func (s *Store) DeleteSession(ctx context.Context, token string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE token_hash = ?`, tokenHash(token))
+	return err
 }
 
 // ---- devices ---------------------------------------------------------------

@@ -49,6 +49,7 @@ type req struct {
 	user         string // value of the Remote-User header ("" = not set)
 	remote       string // peer address (default: the trusted proxy)
 	xff          string
+	cookie       string // sessionid cookie value
 	body         any    // JSON-encoded
 	rawBody      string // sent as-is instead of body
 	contentType  string // default application/json when a body is set
@@ -78,6 +79,9 @@ func (e *env) do(r req) *httptest.ResponseRecorder {
 	}
 	if r.xff != "" {
 		hr.Header.Set("X-Forwarded-For", r.xff)
+	}
+	if r.cookie != "" {
+		hr.AddCookie(&http.Cookie{Name: sessionCookie, Value: r.cookie})
 	}
 	rec := httptest.NewRecorder()
 	e.h.ServeHTTP(rec, hr)
@@ -128,6 +132,54 @@ func TestAuthorization(t *testing.T) {
 	if err != nil || len(users) != 2 || users[0] != "alice" || users[1] != "carol@example.com" {
 		t.Fatalf("users = %v, %v (only alice and carol should have been provisioned)", users, err)
 	}
+}
+
+// AntennaPod sends credentials only on login; the proxy passes later
+// cookie-only requests through without a user header.
+func TestSessions(t *testing.T) {
+	e := newEnv(t)
+	path := "/api/2/devices/alice.json"
+	login := func(user string) string {
+		t.Helper()
+		rec := e.do(req{method: "POST", path: "/api/2/auth/" + user + "/login.json", user: user})
+		wantStatus(t, rec, http.StatusOK)
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == sessionCookie && c.Value != "" && c.HttpOnly && c.Secure && c.Path == "/api/2/" {
+				return c.Value
+			}
+		}
+		t.Fatalf("login set no usable session cookie: %v", rec.Result().Cookies())
+		return ""
+	}
+	tok := login("alice")
+
+	wantStatus(t, e.do(req{method: "GET", path: path, cookie: tok}), http.StatusOK)
+	wantStatus(t, e.do(req{method: "POST", path: "/api/2/devices/alice/phone.json", cookie: tok}), http.StatusOK)
+	// The cookie is only good for its own user, and only via the proxy.
+	wantStatus(t, e.do(req{method: "GET", path: "/api/2/devices/bob.json", cookie: tok}), http.StatusUnauthorized)
+	wantStatus(t, e.do(req{method: "GET", path: path, cookie: tok, remote: "192.0.2.1:1"}), http.StatusForbidden)
+	wantStatus(t, e.do(req{method: "GET", path: path, cookie: "forged"}), http.StatusUnauthorized)
+	// A proxy-authenticated user wins over a cookie for someone else.
+	wantStatus(t, e.do(req{method: "GET", path: path, cookie: login("bob"), user: "alice"}), http.StatusOK)
+
+	// Sessions expire after SessionIdle without use; use keeps them alive.
+	e.clock.t = e.clock.t.Add(store.SessionIdle - time.Hour)
+	wantStatus(t, e.do(req{method: "GET", path: path, cookie: tok}), http.StatusOK)
+	e.clock.t = e.clock.t.Add(store.SessionIdle - time.Hour)
+	wantStatus(t, e.do(req{method: "GET", path: path, cookie: tok}), http.StatusOK)
+	e.clock.t = e.clock.t.Add(store.SessionIdle + time.Second)
+	wantStatus(t, e.do(req{method: "GET", path: path, cookie: tok}), http.StatusUnauthorized)
+
+	tok = login("alice")
+	wantStatus(t, e.do(req{method: "POST", path: "/api/2/auth/alice/logout.json", cookie: tok}), http.StatusOK)
+	wantStatus(t, e.do(req{method: "GET", path: path, cookie: tok}), http.StatusUnauthorized)
+
+	// Deleting a user ends their sessions.
+	tok = login("alice")
+	if err := e.st.DeleteUser(context.Background(), "alice"); err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, e.do(req{method: "GET", path: path, cookie: tok}), http.StatusUnauthorized)
 }
 
 // A cross-site HTML form can only send form or text/plain bodies, so

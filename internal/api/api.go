@@ -89,14 +89,40 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, "ok\n")
 }
 
-// login checks that the proxy authenticated the user. The gpodder spec also sets
-// a session cookie here, but AntennaPod and Kasts send basic auth on every
-// request (which the proxy checks), so the server keeps no sessions.
+// sessionCookie is the cookie gpodder.net clients expect from login.
+const sessionCookie = "sessionid"
+
+// login is reached with credentials the proxy has checked. Clients such as
+// AntennaPod send them only here and then rely on the session cookie, which
+// the proxy passes through without authenticating (see authorize).
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	s.authorize(w, r, r.PathValue("user"))
+	userID, ok := s.authorize(w, r, r.PathValue("user"))
+	if !ok {
+		return
+	}
+	token, err := s.cfg.Store.CreateSession(r.Context(), userID, s.cfg.Now())
+	if err != nil {
+		s.serverError(w, r, err)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookie, Value: token, Path: "/api/2/",
+		MaxAge: int(store.SessionIdle.Seconds()), HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
+	})
 }
 
-func (s *Server) logout(w http.ResponseWriter, r *http.Request) {}
+func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authorize(w, r, r.PathValue("user")); !ok {
+		return
+	}
+	if c, err := r.Cookie(sessionCookie); err == nil {
+		if err := s.cfg.Store.DeleteSession(r.Context(), c.Value); err != nil {
+			s.serverError(w, r, err)
+			return
+		}
+	}
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Path: "/api/2/", MaxAge: -1, HttpOnly: true, Secure: true})
+}
 
 func (s *Server) listDevices(w http.ResponseWriter, r *http.Request) {
 	userID, ok := s.userFromPath(w, r)
@@ -320,10 +346,11 @@ func (s *Server) userAndDevice(w http.ResponseWriter, r *http.Request) (int64, s
 	return userID, deviceID, ok
 }
 
-// authorize checks that the reverse proxy authenticated the request as the
-// user named in the URL. The server does no authentication of its own: the
-// user header is believed only on connections from a trusted proxy, so a
-// client that reaches the server directly cannot impersonate anyone.
+// authorize checks that the request is authenticated as the user named in the
+// URL. Only connections from a trusted proxy are accepted at all, so a client
+// that reaches the server directly cannot impersonate anyone. The user comes
+// from the proxy's user header when the proxy checked credentials, and
+// otherwise from a session cookie issued by login.
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request, username string) (int64, bool) {
 	if !store.ValidUsername(username) {
 		http.NotFound(w, r)
@@ -335,22 +362,44 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, username stri
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return 0, false
 	}
-	// A missing or different user normally means the proxy is misconfigured.
-	user := r.Header.Get(s.cfg.ProxyUserHeader)
-	if user != username {
-		if user != "" {
-			s.cfg.Logger.Warn("authentication failed", "reason", "username mismatch", "user", user,
-				"peer", host, "forwarded_for", r.Header.Get("X-Forwarded-For"))
+	if user := r.Header.Get(s.cfg.ProxyUserHeader); user != "" {
+		// A different user normally means the proxy is misconfigured.
+		if user != username {
+			s.authFailed(w, r, "username mismatch", user)
+			return 0, false
 		}
+		id, err := s.cfg.Store.EnsureUser(r.Context(), user, s.cfg.Now())
+		if err != nil {
+			s.serverError(w, r, err)
+			return 0, false
+		}
+		return id, true
+	}
+	c, err := r.Cookie(sessionCookie)
+	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return 0, false
 	}
-	id, err := s.cfg.Store.EnsureUser(r.Context(), user, s.cfg.Now())
-	if err != nil {
+	id, user, err := s.cfg.Store.SessionUser(r.Context(), c.Value, s.cfg.Now())
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		s.authFailed(w, r, "unknown or expired session", "")
+		return 0, false
+	case err != nil:
 		s.serverError(w, r, err)
+		return 0, false
+	case user != username:
+		s.authFailed(w, r, "session username mismatch", user)
 		return 0, false
 	}
 	return id, true
+}
+
+func (s *Server) authFailed(w http.ResponseWriter, r *http.Request, reason, user string) {
+	_, host := remoteAddr(r)
+	s.cfg.Logger.Warn("authentication failed", "reason", reason, "user", user,
+		"peer", host, "forwarded_for", r.Header.Get("X-Forwarded-For"))
+	http.Error(w, "unauthorized", http.StatusUnauthorized)
 }
 
 // ---- proxies ---------------------------------------------------------------

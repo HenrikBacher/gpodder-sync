@@ -3,9 +3,10 @@
 A small, self-hosted podcast sync server for [AntennaPod](https://antennapod.org/), speaking the
 gpodder.net v2 API. Single static Go binary, SQLite storage, ~15 MB distroless image, built for Unraid.
 
-**It does no authentication itself.** A reverse proxy (Caddy `basic_auth`, or Caddy + Authelia)
-authenticates AntennaPod's basic-auth requests and forwards the username in a header. The server
-holds no passwords and refuses every connection that doesn't come from the trusted proxy IP.
+**It holds no passwords.** A reverse proxy (Caddy `basic_auth`, or Caddy + Authelia) checks
+AntennaPod's basic-auth login and forwards the username in a header. Like gpodder.net, the server
+then issues a session cookie, which AntennaPod uses for the rest of the sync without resending the
+password. Every connection that doesn't come from the trusted proxy IP is refused.
 
 ## Features
 
@@ -17,11 +18,16 @@ holds no passwords and refuses every connection that doesn't come from the trust
 ## How requests are trusted
 
 1. The peer address must be in `GPODDER_SYNC_TRUSTED_PROXIES`, otherwise `403`.
-2. The proxy's user header (`Remote-User` by default) must match the username in the URL,
-   otherwise `401`.
+2. If the proxy's user header (`Remote-User` by default) is set, it must match the username in the
+   URL. Otherwise, the `sessionid` cookie from `login.json` must belong to that user. If neither
+   holds, the server returns `401`.
 
-So the proxy **must** overwrite or strip any client-supplied `Remote-User` header, and nothing but
-the proxy may be able to reach the container:
+The proxy checks credentials on any request that has an `Authorization` header, and passes the
+other requests through for the server to check the cookie. Sessions expire after 30 days without
+use and end on logout. Only a hash of each session token is stored.
+
+So the proxy **must** strip any client-supplied `Remote-User` header, and nothing but the proxy
+may be able to reach the container:
 
 - Don't publish a port. Put the container on the same custom Docker network as Caddy, and only there.
 - Give Caddy a fixed IP on that network and trust **that IP only**, never the subnet: any other
@@ -113,17 +119,22 @@ docker run --rm caddy:2.11.7 caddy hash-password -a argon2id
 
 ```caddyfile
 podsync.example.com {
-	basic_auth argon2id {
-		alice $argon2id$v=19$m=47104,t=1,p=1$...
-	}
-	reverse_proxy gpodder-sync:8080 {
-		header_up Remote-User {http.auth.user.id}   # overwrites any client-supplied value
+	route {                                  # keeps the directives in this order
+		request_header -Remote-User          # drop client-supplied values first
+		@credentials header Authorization *
+		basic_auth @credentials argon2id {
+			alice $argon2id$v=19$m=47104,t=1,p=1$...
+		}
+		request_header @credentials Remote-User {http.auth.user.id}
+		reverse_proxy gpodder-sync:8080
 	}
 }
 ```
 
-Keep `basic_auth` without a matcher so it covers every path. Caddy doesn't rate-limit failed logins
-by itself; add the CrowdSec bouncer or fail2ban on Caddy's logs.
+Requests without an `Authorization` header reach the server with no user, and need a valid session
+cookie. Set `Remote-User` only under `@credentials` as shown: on other requests Caddy would send
+the literal text `{http.auth.user.id}`. Caddy doesn't rate-limit failed logins by itself; add the CrowdSec bouncer or fail2ban on
+Caddy's logs.
 
 ## Proxy setup B: Caddy + Authelia
 
@@ -156,7 +167,8 @@ access_control:
 podsync.example.com {
 	route {                                  # keeps the directives in this order
 		request_header -Remote-User          # drop client-supplied values first
-		forward_auth authelia:9091 {
+		@credentials header Authorization *
+		forward_auth @credentials authelia:9091 {
 			uri /api/authz/forward-auth
 			copy_headers Remote-User
 		}
@@ -165,7 +177,8 @@ podsync.example.com {
 }
 ```
 
-Use a dedicated Authelia user (only in group `podsync`) for AntennaPod rather than your main login.
+Authelia only sees requests with credentials (the login); the server checks the session cookie on
+the rest. Use a dedicated Authelia user (only in group `podsync`) for AntennaPod rather than your main login.
 It works like an app password: it can only reach this domain, and a leaked phone doesn't expose
 your SSO account. Authelia's `regulation` settings then rate-limit failed sync logins.
 *(Setup B is not yet covered by an end-to-end test.)*
@@ -193,7 +206,7 @@ The endpoints AntennaPod uses (`/api/2/`):
 
 | Endpoint | |
 |---|---|
-| `POST auth/{user}/login.json`, `logout.json` | confirms the proxy authenticated the user (no session cookie) |
+| `POST auth/{user}/login.json`, `logout.json` | proxy checks credentials; login sets the `sessionid` cookie, logout ends it |
 | `GET devices/{user}.json`, `POST devices/{user}/{device}.json` | list / create / update devices |
 | `GET`/`POST subscriptions/{user}/{device}.json` | subscription deltas with `since` |
 | `GET`/`POST episodes/{user}.json` | episode actions with `since`, `podcast`, `device`, `aggregated` |
