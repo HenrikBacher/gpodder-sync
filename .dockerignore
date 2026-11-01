@@ -1,0 +1,6 @@
+.git
+.devcontainer
+data
+*.db
+*.db-*
+gpodder-sync

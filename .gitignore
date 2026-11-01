@@ -1,0 +1,5 @@
+/gpodder-sync
+/data/
+*.db
+*.db-shm
+*.db-wal

@@ -1,0 +1,26 @@
+{
+  "name": "gpodder-sync",
+  "build": { "dockerfile": "Dockerfile" },
+  "remoteUser": "vscode",
+  // Rootless podman: map your host UID to the container's vscode user.
+  // Remove this line if you use Docker instead of podman.
+  "runArgs": ["--userns=keep-id"],
+  // Local dev: trust localhost, then fake the proxy with
+  //   curl -H 'Remote-User: alice' localhost:8080/api/2/devices/alice.json
+  "containerEnv": {
+    "GPODDER_SYNC_DB": "${containerWorkspaceFolder}/data/dev.db",
+    "GPODDER_SYNC_TRUSTED_PROXIES": "127.0.0.1,::1"
+  },
+  "forwardPorts": [8080],
+  "postCreateCommand": "mkdir -p data && go mod download",
+  "customizations": {
+    "vscode": {
+      "extensions": ["golang.go"],
+      "settings": {
+        "go.toolsManagement.autoUpdate": false,
+        "go.lintTool": "staticcheck",
+        "go.testFlags": ["-race"]
+      }
+    }
+  }
+}

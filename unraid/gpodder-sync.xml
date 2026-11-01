@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>gpodder-sync</Name>
+  <!-- Replace with where you publish the image, or a locally loaded tag (e.g. gpodder-sync:latest). -->
+  <Repository>ghcr.io/OWNER/gpodder-sync:latest</Repository>
+  <Registry/>
+  <!-- Put it on the same custom network as Caddy, and nothing else. -->
+  <Network>proxynet</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support/>
+  <Project/>
+  <Overview>gpodder.net-compatible podcast sync server for AntennaPod. It does no authentication itself: run it behind Caddy (basic_auth) or Caddy + Authelia, which authenticate clients and forward the username in a header. Requests from anything other than the trusted proxy are refused. No port is published on purpose; only the proxy should reach it.</Overview>
+  <Category>MediaServer:Other</Category>
+  <WebUI/>
+  <TemplateURL/>
+  <Icon/>
+  <!-- Hardening: read-only root filesystem, no Linux capabilities, no privilege escalation. -->
+  <ExtraParams>--read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --cap-drop=ALL --security-opt=no-new-privileges</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <Description>gpodder.net-compatible podcast sync server for AntennaPod, authenticated by your reverse proxy.</Description>
+  <Config Name="Appdata" Target="/data" Default="/mnt/user/appdata/gpodder-sync" Mode="rw" Description="SQLite database. Owned by nobody:users (99:100)." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/gpodder-sync</Config>
+  <Config Name="Trusted proxy IP" Target="GPODDER_SYNC_TRUSTED_PROXIES" Default="" Mode="" Description="Exact IP of your Caddy container on the shared network (give Caddy a fixed IP). Never the whole subnet." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="Proxy user header" Target="GPODDER_SYNC_PROXY_USER_HEADER" Default="Remote-User" Mode="" Description="Header carrying the authenticated username. Remote-User matches Authelia; use the same name in Caddy's header_up for basic_auth." Type="Variable" Display="advanced" Required="false" Mask="false">Remote-User</Config>
+</Container>
