@@ -48,6 +48,18 @@ The template:
 - adds hardening Extra Parameters: `--read-only --tmpfs /tmp --cap-drop=ALL --security-opt=no-new-privileges`.
 - passes Unraid's `TZ`, which is used for log timestamps.
 
+**appdata must be an exclusive share.** SQLite's WAL mode isn't safe on Unraid's FUSE layer
+(`shfs`), which `/mnt/user` normally goes through. Make appdata exclusive so `/mnt/user/appdata`
+points straight at the pool (Unraid 6.12+):
+
+1. Settings → Global Share Settings → *Permit exclusive shares*: Yes (with the array stopped).
+2. Shares → appdata: Primary storage = your pool, Secondary storage = None, NFS export off.
+3. Move any appdata files off the array disks, so `ls -d /mnt/disk*/appdata` finds nothing.
+
+Check with `stat -f -c %T /mnt/user/appdata/`: `btrfs`, `xfs` or `zfs` is good, `fuse` is not.
+It silently stops being exclusive if appdata gets files on another disk again, so re-check after
+changing share settings. Recreate the container after enabling it.
+
 The image has no shell (distroless), so Unraid's *Console* button won't work. Use
 `docker exec gpodder-sync /gpodder-sync user list` instead.
 

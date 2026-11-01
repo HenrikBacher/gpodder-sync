@@ -49,18 +49,26 @@ type req struct {
 	user         string // value of the Remote-User header ("" = not set)
 	remote       string // peer address (default: the trusted proxy)
 	xff          string
-	body         any
+	body         any    // JSON-encoded
+	rawBody      string // sent as-is instead of body
+	contentType  string // default application/json when a body is set
 }
 
 func (e *env) do(r req) *httptest.ResponseRecorder {
 	e.t.Helper()
-	var body bytes.Buffer
+	body := bytes.NewBufferString(r.rawBody)
 	if r.body != nil {
-		if err := json.NewEncoder(&body).Encode(r.body); err != nil {
+		if err := json.NewEncoder(body).Encode(r.body); err != nil {
 			e.t.Fatal(err)
 		}
 	}
-	hr := httptest.NewRequest(r.method, r.path, &body)
+	hr := httptest.NewRequest(r.method, r.path, body)
+	switch {
+	case r.contentType != "":
+		hr.Header.Set("Content-Type", r.contentType)
+	case body.Len() > 0:
+		hr.Header.Set("Content-Type", "application/json; charset=utf-8")
+	}
 	hr.RemoteAddr = proxyAddr
 	if r.remote != "" {
 		hr.RemoteAddr = r.remote
@@ -111,34 +119,37 @@ func TestAuthorization(t *testing.T) {
 	// Bob, authenticated by the proxy, cannot read Alice's data.
 	wantStatus(t, e.do(req{method: "GET", path: path, user: "bob"}), http.StatusUnauthorized)
 	wantStatus(t, e.do(req{method: "GET", path: "/api/2/devices/bad%20name.json", user: "bad name"}), http.StatusNotFound)
+	// Email-style names, as Authelia/LDAP often use.
+	wantStatus(t, e.do(req{method: "GET", path: "/api/2/devices/carol@example.com.json", user: "carol@example.com"}), http.StatusOK)
 	// Health checks come from localhost inside the container.
 	wantStatus(t, e.do(req{method: "GET", path: "/healthz", remote: "127.0.0.1:9"}), http.StatusOK)
 
 	users, err := e.st.ListUsers(context.Background())
-	if err != nil || len(users) != 1 || users[0] != "alice" {
-		t.Fatalf("users = %v, %v (only alice should have been provisioned)", users, err)
+	if err != nil || len(users) != 2 || users[0] != "alice" || users[1] != "carol@example.com" {
+		t.Fatalf("users = %v, %v (only alice and carol should have been provisioned)", users, err)
 	}
 }
 
-func TestClientIP(t *testing.T) {
-	s := New(Config{TrustedProxies: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}})
-	cases := []struct{ remote, xff, want string }{
-		{"192.0.2.1:1", "", "192.0.2.1"},
-		{"192.0.2.1:1", "203.0.113.5", "192.0.2.1"}, // untrusted peer: header ignored
-		{"10.0.0.2:1", "203.0.113.5", "203.0.113.5"},
-		{"10.0.0.2:1", "6.6.6.6, 203.0.113.5, 10.0.0.3", "203.0.113.5"}, // spoofed left-most entry ignored
-		{"10.0.0.2:1", "garbage", "10.0.0.2"},
+// A cross-site HTML form can only send form or text/plain bodies, so
+// requiring application/json keeps other websites from posting changes with
+// credentials the browser has cached for this site.
+func TestRequiresJSONContentType(t *testing.T) {
+	e := newEnv(t)
+	// What <form enctype="text/plain"> produces: valid JSON, wrong type.
+	form := `{"add":["https://evil.example/feed.xml"],"x":"="}`
+	for _, ct := range []string{"text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x"} {
+		rec := e.do(req{method: "POST", path: "/api/2/subscriptions/alice/phone.json", user: "alice", rawBody: form, contentType: ct})
+		wantStatus(t, rec, http.StatusUnsupportedMediaType)
 	}
-	for _, c := range cases {
-		r := httptest.NewRequest("GET", "/", nil)
-		r.RemoteAddr = c.remote
-		if c.xff != "" {
-			r.Header.Set("X-Forwarded-For", c.xff)
-		}
-		if got := s.clientIP(r); got != c.want {
-			t.Errorf("clientIP(%s, %q) = %s, want %s", c.remote, c.xff, got, c.want)
-		}
+	wantStatus(t, e.do(req{method: "POST", path: "/api/2/episodes/alice.json", user: "alice", rawBody: "[]", contentType: "text/plain"}),
+		http.StatusUnsupportedMediaType)
+	if subs := decode[subsResp](t, e.alice("GET", "/api/2/subscriptions/alice/phone.json", nil)); len(subs.Add) != 0 {
+		t.Fatalf("form post was stored: %+v", subs)
 	}
+	// Device registration may have an empty body without a Content-Type.
+	wantStatus(t, e.do(req{method: "POST", path: "/api/2/devices/alice/phone.json", user: "alice"}), http.StatusOK)
+	wantStatus(t, e.do(req{method: "POST", path: "/api/2/subscriptions/alice/phone.json", user: "alice", rawBody: "{not json", contentType: "application/json"}),
+		http.StatusBadRequest)
 }
 
 func TestDevices(t *testing.T) {

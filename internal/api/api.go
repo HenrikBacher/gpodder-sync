@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/netip"
@@ -25,14 +26,17 @@ const (
 	tsLayout     = "2006-01-02T15:04:05"
 )
 
+// DefaultUserHeader is the header Authelia uses for the authenticated user.
+const DefaultUserHeader = "Remote-User"
+
 // Config configures a Server.
 type Config struct {
 	Store *store.Store
 	// TrustedProxies are the only peers allowed to talk to the server; their
-	// ProxyUserHeader and X-Forwarded-For headers are believed.
+	// ProxyUserHeader is believed.
 	TrustedProxies []netip.Prefix
 	// ProxyUserHeader carries the username authenticated by the proxy
-	// (default "Remote-User", as set by Authelia).
+	// (default DefaultUserHeader).
 	ProxyUserHeader string
 	Logger          *slog.Logger
 	Now             func() time.Time
@@ -46,7 +50,7 @@ type Server struct {
 // New creates a Server.
 func New(cfg Config) *Server {
 	if cfg.ProxyUserHeader == "" {
-		cfg.ProxyUserHeader = "Remote-User"
+		cfg.ProxyUserHeader = DefaultUserHeader
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
@@ -95,12 +99,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {}
 
 func (s *Server) listDevices(w http.ResponseWriter, r *http.Request) {
-	username, ok := trimJSON(r.PathValue("userfmt"))
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	userID, ok := s.authorize(w, r, username)
+	userID, ok := s.userFromPath(w, r)
 	if !ok {
 		return
 	}
@@ -129,8 +128,7 @@ func (s *Server) updateDevice(w http.ResponseWriter, r *http.Request) {
 		Caption *string `json:"caption"`
 		Type    *string `json:"type"`
 	}
-	if err := decodeJSON(w, r, &body); err != nil && !errors.Is(err, io.EOF) {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !readJSON(w, r, &body, true) {
 		return
 	}
 	if body.Type != nil && !deviceTypes[*body.Type] {
@@ -176,8 +174,7 @@ func (s *Server) postSubscriptions(w http.ResponseWriter, r *http.Request) {
 		Add    []string `json:"add"`
 		Remove []string `json:"remove"`
 	}
-	if err := decodeJSON(w, r, &body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !readJSON(w, r, &body, false) {
 		return
 	}
 	updateURLs := [][2]string{}
@@ -214,12 +211,7 @@ func (s *Server) postSubscriptions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getEpisodes(w http.ResponseWriter, r *http.Request) {
-	username, ok := trimJSON(r.PathValue("userfmt"))
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	userID, ok := s.authorize(w, r, username)
+	userID, ok := s.userFromPath(w, r)
 	if !ok {
 		return
 	}
@@ -248,18 +240,12 @@ func (s *Server) getEpisodes(w http.ResponseWriter, r *http.Request) {
 var episodeActions = map[string]bool{"download": true, "delete": true, "play": true, "new": true, "flattr": true}
 
 func (s *Server) postEpisodes(w http.ResponseWriter, r *http.Request) {
-	username, ok := trimJSON(r.PathValue("userfmt"))
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	userID, ok := s.authorize(w, r, username)
+	userID, ok := s.userFromPath(w, r)
 	if !ok {
 		return
 	}
 	var actions []store.EpisodeAction
-	if err := decodeJSON(w, r, &actions); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !readJSON(w, r, &actions, false) {
 		return
 	}
 	now := s.cfg.Now()
@@ -313,6 +299,17 @@ func normalizeTimestamp(s string, now time.Time) (string, error) {
 
 // ---- authentication --------------------------------------------------------
 
+// userFromPath authorizes routes of the form /api/2/<kind>/{user}.json.
+func (s *Server) userFromPath(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	username, ok := trimJSON(r.PathValue("userfmt"))
+	if !ok {
+		http.NotFound(w, r)
+		return 0, false
+	}
+	return s.authorize(w, r, username)
+}
+
+// userAndDevice authorizes routes of the form /api/2/<kind>/{user}/{device}.json.
 func (s *Server) userAndDevice(w http.ResponseWriter, r *http.Request) (int64, string, bool) {
 	deviceID, ok := trimJSON(r.PathValue("devicefmt"))
 	if !ok || !store.ValidDeviceID(deviceID) {
@@ -338,12 +335,14 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, username stri
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return 0, false
 	}
+	// A missing or different user normally means the proxy is misconfigured.
 	user := r.Header.Get(s.cfg.ProxyUserHeader)
 	if user != username {
 		if user != "" {
-			s.cfg.Logger.Warn("authentication failed", "reason", "username mismatch", "user", user, "ip", s.clientIP(r))
+			s.cfg.Logger.Warn("authentication failed", "reason", "username mismatch", "user", user,
+				"peer", host, "forwarded_for", r.Header.Get("X-Forwarded-For"))
 		}
-		s.unauthorized(w)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return 0, false
 	}
 	id, err := s.cfg.Store.EnsureUser(r.Context(), user, s.cfg.Now())
@@ -352,12 +351,6 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, username stri
 		return 0, false
 	}
 	return id, true
-}
-
-// unauthorized is reached when the proxy forwarded a request without (or
-// with a different) user, which normally means the proxy is misconfigured.
-func (s *Server) unauthorized(w http.ResponseWriter) {
-	http.Error(w, "unauthorized", http.StatusUnauthorized)
 }
 
 // ---- proxies ---------------------------------------------------------------
@@ -379,30 +372,6 @@ func remoteAddr(r *http.Request) (netip.Addr, string) {
 	}
 	addr, _ := netip.ParseAddr(host)
 	return addr, host
-}
-
-// clientIP returns the client address, honouring X-Forwarded-For only when
-// the request came from a trusted proxy. It walks the header from the right
-// and returns the first address that is not itself a trusted proxy.
-func (s *Server) clientIP(r *http.Request) string {
-	addr, host := remoteAddr(r)
-	if !addr.IsValid() || !s.trusted(addr) {
-		return host
-	}
-	var hops []string
-	for _, v := range r.Header.Values("X-Forwarded-For") {
-		hops = append(hops, strings.Split(v, ",")...)
-	}
-	for i := len(hops) - 1; i >= 0; i-- {
-		hop, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
-		if err != nil {
-			break
-		}
-		if !s.trusted(hop) {
-			return hop.Unmap().String()
-		}
-	}
-	return host
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -438,21 +407,29 @@ func sanitizeURL(raw string) string {
 	return u
 }
 
-func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
+// readJSON decodes the request body into v, writing an error response and
+// returning false on failure. Requiring Content-Type: application/json stops
+// cross-site HTML forms (which can only send form or text/plain bodies) from
+// riding on credentials the browser has cached for this site.
+func readJSON(w http.ResponseWriter, r *http.Request, v any, allowEmpty bool) bool {
+	if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt != "application/json" {
+		if !(allowEmpty && r.ContentLength == 0) {
+			http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+			return false
+		}
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	err := json.NewDecoder(r.Body).Decode(v)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return fmt.Errorf("invalid JSON body: %w", err)
+	if err == nil || (allowEmpty && errors.Is(err, io.EOF)) {
+		return true
 	}
-	return err
+	http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		// Headers are already sent; nothing more we can do.
-		return
-	}
+	json.NewEncoder(w).Encode(v) // headers are sent; an error here can't be reported
 }
 
 func (s *Server) serverError(w http.ResponseWriter, r *http.Request, err error) {
@@ -478,7 +455,9 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 		if r.URL.Path == "/healthz" && rec.status == http.StatusOK {
 			return
 		}
+		_, peer := remoteAddr(r)
 		s.cfg.Logger.Info("request", "method", r.Method, "path", r.URL.Path, "status", rec.status,
-			"duration", time.Since(start).Round(time.Millisecond), "ip", s.clientIP(r))
+			"duration", time.Since(start).Round(time.Millisecond), "peer", peer,
+			"forwarded_for", r.Header.Get("X-Forwarded-For"))
 	})
 }

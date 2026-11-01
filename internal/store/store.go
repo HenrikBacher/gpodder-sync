@@ -18,7 +18,8 @@ import (
 var ErrNotFound = errors.New("not found")
 
 var (
-	usernameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	// '@' allows email-style names, common with Authelia/LDAP.
+	usernameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$`)
 	deviceRE   = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
 )
 

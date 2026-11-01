@@ -84,7 +84,7 @@ func cmdServe(args []string) error {
 	dbPath := dbFlag(fs)
 	proxies := fs.String("trusted-proxies", os.Getenv("GPODDER_SYNC_TRUSTED_PROXIES"),
 		"comma-separated IPs/CIDRs of the reverse proxy; all other peers are refused")
-	userHeader := fs.String("proxy-user-header", envOr("GPODDER_SYNC_PROXY_USER_HEADER", "Remote-User"),
+	userHeader := fs.String("proxy-user-header", envOr("GPODDER_SYNC_PROXY_USER_HEADER", api.DefaultUserHeader),
 		"header carrying the username authenticated by the proxy")
 	fs.Parse(args)
 
@@ -94,9 +94,6 @@ func cmdServe(args []string) error {
 	}
 	if len(trusted) == 0 {
 		return errors.New("set GPODDER_SYNC_TRUSTED_PROXIES (or -trusted-proxies) to your reverse proxy's IP")
-	}
-	if *userHeader == "" {
-		return errors.New("-proxy-user-header must not be empty")
 	}
 	st, err := store.Open(*dbPath)
 	if err != nil {
