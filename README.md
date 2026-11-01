@@ -31,7 +31,7 @@ the proxy may be able to reach the container:
 ## Unraid
 
 1. Get the image onto the server. CI publishes `ghcr.io/henrikbacher/gpodder-sync` (amd64 + arm64):
-   `:latest` / `:X.Y.Z` / `:X.Y` from `vX.Y.Z` tags, `:edge` from `main`. Or build for amd64 from any machine:
+   `:latest` + `:edge` from every `main` build, `:X.Y.Z` / `:X.Y` (and `:latest`) from `vX.Y.Z` tags. Or build for amd64 from any machine:
    ```sh
    docker build --platform linux/amd64 --build-arg VERSION=0.1.0 -t gpodder-sync:latest .
    docker save gpodder-sync:latest | ssh root@unraid docker load      # or push to a registry
