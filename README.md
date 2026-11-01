@@ -30,28 +30,13 @@ the proxy may be able to reach the container:
 
 ## Unraid
 
-1. Get the image onto the server. CI publishes `ghcr.io/henrikbacher/gpodder-sync` (amd64 + arm64):
-   `:latest` + `:edge` from every `main` build, `:X.Y.Z` / `:X.Y` (and `:latest`) from `vX.Y.Z` tags. Or build for amd64 from any machine:
-   ```sh
-   docker build --platform linux/amd64 --build-arg VERSION=0.1.0 -t gpodder-sync:latest .
-   docker save gpodder-sync:latest | ssh root@unraid docker load      # or push to a registry
-   ```
-2. Copy `unraid/gpodder-sync.xml` to `/boot/config/plugins/dockerMan/templates-user/my-gpodder-sync.xml`,
-   set `<Repository>` to your image (`gpodder-sync:latest` for a loaded image, or your registry path),
-   then Docker → Add Container → pick **gpodder-sync** from the template list.
-3. Set **Network** to Caddy's custom network and **Trusted proxy IP** to Caddy's fixed IP.
+The image is published to `ghcr.io/henrikbacher/gpodder-sync` (amd64 + arm64, public, no login
+needed). `:latest` follows `main`; `:X.Y.Z` / `:X.Y` are pinned releases.
 
-The template:
+### 1. Make appdata an exclusive share
 
-- maps `/mnt/user/appdata/gpodder-sync` → `/data`. The image runs as 99:100, which already owns
-  appdata, so no `chown` is needed.
-- publishes no port.
-- adds hardening Extra Parameters: `--read-only --tmpfs /tmp --cap-drop=ALL --security-opt=no-new-privileges`.
-- passes Unraid's `TZ`, which is used for log timestamps.
-
-**appdata must be an exclusive share.** SQLite's WAL mode isn't safe on Unraid's FUSE layer
-(`shfs`), which `/mnt/user` normally goes through. Make appdata exclusive so `/mnt/user/appdata`
-points straight at the pool (Unraid 6.12+):
+SQLite's WAL mode isn't safe on Unraid's FUSE layer (`shfs`), which `/mnt/user` normally goes
+through. Make appdata exclusive so `/mnt/user/appdata` points straight at the pool (Unraid 6.12+):
 
 1. Settings → Global Share Settings → *Permit exclusive shares*: Yes (with the array stopped).
 2. Shares → appdata: Primary storage = your pool, Secondary storage = None, NFS export off.
@@ -59,10 +44,64 @@ points straight at the pool (Unraid 6.12+):
 
 Check with `stat -f -c %T /mnt/user/appdata/`: `btrfs`, `xfs` or `zfs` is good, `fuse` is not.
 It silently stops being exclusive if appdata gets files on another disk again, so re-check after
-changing share settings. Recreate the container after enabling it.
+changing share settings, and recreate the container after enabling it.
 
-The image has no shell (distroless), so Unraid's *Console* button won't work. Use
-`docker exec gpodder-sync /gpodder-sync user list` instead.
+### 2. Put Caddy on a custom network with a fixed IP
+
+The template expects a network called `proxynet`. Create it once from the Unraid terminal if you
+don't have one:
+
+```sh
+docker network create --subnet 172.20.0.0/24 proxynet
+```
+
+Edit the Caddy container: **Network Type** = `proxynet`, **Fixed IP address** = e.g. `172.20.0.2`.
+(Settings → Docker → *Preserve user defined networks*: Yes, so the network survives a Docker restart.)
+
+### 3. Install the template
+
+```sh
+wget -O /boot/config/plugins/dockerMan/templates-user/my-gpodder-sync.xml \
+  https://raw.githubusercontent.com/HenrikBacher/gpodder-sync/main/unraid/gpodder-sync.xml
+```
+
+### 4. Add the container
+
+Docker → **Add Container** → pick **gpodder-sync** from the template list, then set:
+
+- **Trusted proxy IP**: Caddy's exact IP (`172.20.0.2`), never the subnet.
+- **Network**: `proxynet` (preset). Leave it with no port mapping; only Caddy should reach it.
+
+The template also:
+
+- maps `/mnt/user/appdata/gpodder-sync` → `/data`. The image runs as 99:100, which already owns
+  appdata, so no `chown` is needed.
+- adds hardening Extra Parameters: `--read-only --tmpfs /tmp --cap-drop=ALL --security-opt=no-new-privileges`.
+- gets Unraid's `TZ`, which is used for log timestamps.
+
+### 5. Configure Caddy and AntennaPod
+
+Add a site block from [Proxy setup A](#proxy-setup-a-caddy-basic_auth) or
+[B](#proxy-setup-b-caddy--authelia), reload Caddy, then connect [AntennaPod](#antennapod).
+
+### 6. Check it works
+
+- The container shows **healthy** in the Docker tab.
+- `curl -u alice:PASSWORD https://podsync.example.com/api/2/devices/alice.json` returns `[]`
+  (or your devices), not `401`/`403`.
+- After AntennaPod's first sync, `docker exec gpodder-sync /gpodder-sync user list` shows the user.
+
+The image has no shell (distroless), so Unraid's *Console* button won't work; use `docker exec`
+as above. Updates: Docker tab → *Check for Updates* pulls the newest `:latest`.
+
+### Building the image yourself
+
+```sh
+docker build --platform linux/amd64 --build-arg VERSION=0.1.0 -t gpodder-sync:latest .
+docker save gpodder-sync:latest | ssh root@unraid docker load
+```
+
+Then set the container's **Repository** to `gpodder-sync:latest`.
 
 ## Proxy setup A: Caddy `basic_auth`
 
