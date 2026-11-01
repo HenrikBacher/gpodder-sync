@@ -2,7 +2,7 @@
 <Container version="2">
   <Name>gpodder-sync</Name>
   <!-- Replace with where you publish the image, or a locally loaded tag (e.g. gpodder-sync:latest). -->
-  <Repository>ghcr.io/OWNER/gpodder-sync:latest</Repository>
+  <Repository>ghcr.io/henrikbacher/gpodder-sync:latest</Repository>
   <Registry/>
   <!-- Put it on the same custom network as Caddy, and nothing else. -->
   <Network>proxynet</Network>
